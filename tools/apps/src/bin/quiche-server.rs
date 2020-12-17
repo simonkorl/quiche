@@ -45,6 +45,8 @@ use quiche_apps::common::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
+const MAX_SEND_BURST_LIMIT: usize = MAX_DATAGRAM_SIZE * 10;
+
 fn main() {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
@@ -331,6 +333,7 @@ fn main() {
                     partial_responses: HashMap::new(),
                     siduck_conn: None,
                     app_proto_selected: false,
+                    bytes_sent: 0,
                 };
 
                 clients.insert(scid.clone(), (src, client));
@@ -472,6 +475,19 @@ fn main() {
                 }
 
                 trace!("{} written {} bytes", client.conn.trace_id(), write);
+
+                // limit write bursting
+                client.bytes_sent += write;
+
+                if client.bytes_sent >= MAX_SEND_BURST_LIMIT {
+                    trace!(
+                        "{} pause writing at {}",
+                        client.conn.trace_id(),
+                        client.bytes_sent
+                    );
+                    client.bytes_sent = 0;
+                    break;
+                }
             }
         }
 
