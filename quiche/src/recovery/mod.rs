@@ -690,7 +690,7 @@ impl Recovery {
     }
 
     pub fn pacing_rate(&self) -> u64 {
-        self.pacing_rate
+        self.pacer.rate()
     }
 
     pub fn delivery_rate(&self) -> u64 {

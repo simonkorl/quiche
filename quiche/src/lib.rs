@@ -2962,6 +2962,7 @@ impl Connection {
             #[cfg(feature = "diffserv")]
             let (ty, written) = match self.send_single(
                 &mut out[done..done + left],
+                send_pid,
                 has_initial,
                 &mut diffserv,
             ) {
@@ -3066,8 +3067,8 @@ impl Connection {
 
         #[cfg(feature = "dtp")]
         let rate_rtt = (
-            (self.recovery.pacing_rate() >> 10),
-            (self.recovery.rtt().as_millis() >> 1) as u64,
+            (self.paths.get(send_pid)?.recovery.pacing_rate() >> 10),
+            (self.paths.get(send_pid)?.recovery.rtt().as_millis() >> 1) as u64,
         );
 
         // Process lost frames. There might be several paths having lost frames.
@@ -4103,8 +4104,8 @@ impl Connection {
                         incremental,
                         #[cfg(feature = "dtp")]
                         (
-                            (self.recovery.pacing_rate() >> 10),
-                            (self.recovery.rtt().as_millis() >> 1) as u64,
+                            (self.paths.get(send_pid)?.recovery.pacing_rate() >> 10),
+                            (self.paths.get(send_pid)?.recovery.rtt().as_millis() >> 1) as u64,
                         ),
                     );
                 }
@@ -4632,8 +4633,8 @@ impl Connection {
                 incremental,
                 #[cfg(feature = "dtp")]
                 (
-                    (self.recovery.pacing_rate() >> 10),
-                    (self.recovery.rtt().as_millis() >> 1) as u64,
+                    (2147483647), // TODO: we can't get pacing rate and rtt without knowing the sending path
+                    (0),
                 ),
             );
         }
@@ -4809,8 +4810,8 @@ impl Connection {
                 urgency,
                 incremental,
                 (
-                    (self.recovery.pacing_rate() >> 10),
-                    (self.recovery.rtt().as_millis() >> 1) as u64,
+                    (2147483647), // TODO: we can't get pacing rate and rtt without knowing the sending path
+                    (0),
                 ),
             );
         }
@@ -6916,8 +6917,8 @@ impl Connection {
                         incremental,
                         #[cfg(feature = "dtp")]
                         (
-                            (self.recovery.pacing_rate() >> 10),
-                            (self.recovery.rtt().as_millis() >> 1) as u64,
+                            (2147483647), // TODO: we can't get pacing rate and rtt without knowing the sending path
+                            (0),
                         ),
                     );
                 }

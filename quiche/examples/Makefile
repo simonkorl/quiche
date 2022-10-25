@@ -42,7 +42,7 @@ dtptest-server: dtptest-server.c $(INCLUDE_DIR)/quiche.h $(LIB_DIR)/libquiche.a
 	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@ $(INCS) $(LIBS)
 
 $(LIB_DIR)/libquiche.a: $(shell find $(SOURCE_DIR) -type f -name '*.rs')
-	cd .. && cargo build --target-dir $(BUILD_DIR) --features ffi,diffserv --release
+	cd .. && cargo build --target-dir $(BUILD_DIR) --features ffi,diffserv,dtp --release
 
 clean:
 	@$(RM) -rf client server http3-client http3-server build/ *.dSYM/
