@@ -27,6 +27,8 @@
 use std::cmp;
 
 use std::sync::Arc;
+#[cfg(feature = "dtp")]
+use std::sync::Weak;
 
 use std::collections::hash_map;
 
@@ -37,6 +39,8 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use std::time;
+
+use slab::Slab;
 
 use crate::Error;
 use crate::Result;
@@ -91,6 +95,15 @@ type BuildStreamIdHasher = std::hash::BuildHasherDefault<StreamIdHasher>;
 pub type StreamIdHashMap<V> = HashMap<u64, V, BuildStreamIdHasher>;
 pub type StreamIdHashSet = HashSet<u64, BuildStreamIdHasher>;
 
+#[cfg(feature = "dtp")]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct RecoveryInfo {
+    /// the pacing rate of one path
+    pub pacing_rate: u64, // pacer.pacing_rate() >> 10
+    /// 1/2 RTT of one path
+    pub rtt: u64, // recovery.rtt().as_millis() >> 1 (millis)  
+}
+
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
 pub struct StreamMap {
@@ -141,7 +154,12 @@ pub struct StreamMap {
     /// same urgency level Non-incremental streams are scheduled first, in the
     /// order of their stream IDs, and incremental streams are scheduled in a
     /// round-robin fashion after all non-incremental streams have been flushed.
+    #[cfg(not(feature = "dtp"))]
     flushable: BTreeMap<u8, (BinaryHeap<std::cmp::Reverse<u64>>, VecDeque<u64>)>,
+
+    /// TODO: flushable in dtp
+    #[cfg(feature = "dtp")]
+    flushable: Scheduler,
 
     /// Set of stream IDs corresponding to streams that have outstanding data
     /// to read. This is used to generate a `StreamIter` of streams without
@@ -174,6 +192,14 @@ pub struct StreamMap {
     /// receive side, and need to send a STOP_SENDING frame. The value of the
     /// map elements is the error code to include in the STOP_SENDING frame.
     stopped: StreamIdHashMap<u64>,
+
+    /// Set of stream IDs corresponding to streams that are shutdown on the
+    /// send side, and need to send a STOP_SENDING frame.
+    #[cfg(feature = "dtp")]
+    cancelled: StreamIdHashMap<u64>,
+
+    #[cfg(feature = "dtp")]
+    prev_bw_rtt: (u64, u64),
 
     /// The maximum size of a stream window.
     max_stream_window: u64,
@@ -221,6 +247,7 @@ impl StreamMap {
     pub(crate) fn get_or_create(
         &mut self, id: u64, local_params: &crate::TransportParams,
         peer_params: &crate::TransportParams, local: bool, is_server: bool,
+        #[cfg(feature = "dtp")] block: Option<Arc<Block>>,
     ) -> Result<&mut Stream> {
         let stream = match self.streams.entry(id) {
             hash_map::Entry::Vacant(v) => {
@@ -320,6 +347,8 @@ impl StreamMap {
                     is_bidi(id),
                     local,
                     self.max_stream_window,
+                    #[cfg(feature = "dtp")]
+                    block,
                 );
                 v.insert(s)
             },
@@ -344,16 +373,81 @@ impl StreamMap {
     /// Queueing a stream multiple times simultaneously means that it might be
     /// unfairly scheduled more often than other streams, and might also cause
     /// spurious cycles through the queue, so it should be avoided.
-    pub fn push_flushable(&mut self, stream_id: u64, urgency: u8, incr: bool) {
-        // Push the element to the back of the queue corresponding to the given
-        // urgency. If the queue doesn't exist yet, create it first.
+    pub fn push_flushable(
+        &mut self, stream_id: u64, urgency: u8, incr: bool,
+        #[cfg(feature = "dtp")] recoveries: &Slab<RecoveryInfo>,
+    ) {
+        #[cfg(feature = "dtp")]
+        {
+            // enable dtp scheduler only in single path
+            if recoveries.len() == 1 {
+                let recovery = (recoveries[0].pacing_rate, recoveries[0].rtt);
+                // Check whether the network changes are large enough (10% of
+                // previous)
+                if self.network_varied(recoveries) {
+                    self.update_flushable(recoveries);
+                }
+
+                // Push the element to the queue corresponding to the given recovery
+                let stream = self.get_mut(stream_id).unwrap();
+                let block = &stream.block;
+                if block.is_some() {
+                    let service_time = stream
+                        .send
+                        .started_at
+                        .unwrap()
+                        .elapsed()
+                        .unwrap()
+                        .as_millis() as u64;
+                    let block = block.clone().unwrap();
+                    if service_time > block.deadline {
+                        let (final_size, _unsent) =
+                            stream.send.shutdown().unwrap_or((0, 0));
+                        self.mark_cancelled(stream_id, true, final_size);
+                        info!(
+                            "service_time {} > block.deadline {}",
+                            service_time, block.deadline
+                        );
+                        return;
+                    }
+                    match block.real_priority(recovery.0, recovery.1, service_time) {
+                        Some(priority) => {
+                            self.flushable.dtp_scheduler.push(std::cmp::Reverse(
+                                FlushableBlock {
+                                    stream_id,
+                                    priority,
+                                },
+                            ));
+                        },
+                        None => {
+                            let (final_size, _unsent) =
+                                stream.send.shutdown().unwrap_or((0, 0));
+                            self.mark_cancelled(stream_id, true, final_size);
+                        },
+                    };
+                    return;
+                }
+            }
+        }
+
+        // Push the element to the back of the queue corresponding to the
+        // given urgency. If the queue doesn't exist yet, create
+        // it first.
+        #[cfg(not(feature = "dtp"))]
         let queues = self
             .flushable
             .entry(urgency)
             .or_insert_with(|| (BinaryHeap::new(), VecDeque::new()));
+        #[cfg(feature = "dtp")]
+        let queues = self
+            .flushable
+            .quic_scheduler
+            .entry(urgency)
+            .or_insert_with(|| (BinaryHeap::new(), VecDeque::new()));
 
         if !incr {
-            // Non-incremental streams are scheduled in order of their stream ID.
+            // Non-incremental streams are scheduled in order of their stream
+            // ID.
             queues.0.push(std::cmp::Reverse(stream_id))
         } else {
             // Incremental streams are scheduled in a round-robin fashion.
@@ -366,6 +460,7 @@ impl StreamMap {
     ///
     /// Note that if the stream is still flushable after sending some of its
     /// outstanding data, it needs to be added back to the queue.
+    #[cfg(not(feature = "dtp"))]
     pub fn pop_flushable(&mut self) -> Option<u64> {
         // Remove the first element from the queue corresponding to the lowest
         // urgency that has elements.
@@ -396,6 +491,120 @@ impl StreamMap {
         }
 
         node
+    }
+
+    /// Removes and returns the first stream ID from the flushable streams
+    /// queue with the specified urgency.
+    ///
+    /// Note that if the stream is still flushable after sending some of its
+    /// outstanding data, it needs to be added back to the queue.
+    #[cfg(feature = "dtp")]
+    pub fn pop_flushable(&mut self, recoveries: &Slab<RecoveryInfo>, _path_id: usize) -> Option<u64> {
+        if !self.flushable.dtp_scheduler.is_empty() {
+            // If the network condition changes greatly, re-schedule;
+            // If a frame is lost, re-schedule. (in lib.rs::send_single)
+            // If new block comes, re-schedule. (in push_flushable)
+            // Can change to the pkt-level schedule.
+            // The idea above comes from MPDTP
+            if self.network_varied(recoveries) {
+                self.update_flushable(recoveries);
+            }
+            let node = self.flushable.dtp_scheduler.pop().map(|x| x.0.stream_id);
+            return node;
+        }
+
+        // Remove the first element from the queue corresponding to the lowest
+        // urgency that has elements.
+        let (node, clear) = if let Some((urgency, queues)) =
+            self.flushable.quic_scheduler.iter_mut().next()
+        {
+            let node = if !queues.0.is_empty() {
+                queues.0.pop().map(|x| x.0)
+            } else {
+                queues.1.pop_front()
+            };
+
+            let clear = if queues.0.is_empty() && queues.1.is_empty() {
+                Some(*urgency)
+            } else {
+                None
+            };
+
+            (node, clear)
+        } else {
+            (None, None)
+        };
+
+        // Remove the queue from the list of queues if it is now empty, so that
+        // the next time `pop_flushable()` is called the next queue with elements
+        // is used.
+        if let Some(urgency) = &clear {
+            self.flushable.quic_scheduler.remove(urgency);
+        }
+
+        node
+    }
+
+    #[cfg(feature = "dtp")]
+    // Check whether the network changes greatly
+    // this is a simple implementation (change 10% of previous)
+    pub fn network_varied(&mut self, recoveries: &Slab<RecoveryInfo>) -> bool {
+        let prev_bw_rtt = self.prev_bw_rtt;
+        let recovery = (recoveries[0].pacing_rate, recoveries[0].rtt);
+        let result = (prev_bw_rtt.0.abs_diff(recovery.0) > (prev_bw_rtt.0 / 10)) ||
+            (prev_bw_rtt.1.abs_diff(recovery.1) > (prev_bw_rtt.1 / 10));
+        self.prev_bw_rtt = recovery;
+        return result;
+    }
+
+    #[cfg(feature = "dtp")]
+    pub fn update_flushable(&mut self, recoveries: &Slab<RecoveryInfo>) {
+        let recovery = (recoveries[0].pacing_rate, recoveries[0].rtt);
+        let flushable = self.flushable.dtp_scheduler.clone().into_vec();
+        let flushable = flushable
+            .iter()
+            .filter_map(|std::cmp::Reverse(b)| {
+                let stream = self.get_mut(b.stream_id).unwrap();
+                let block = stream.block.as_ref().unwrap();
+                let service_time = stream
+                    .send
+                    .started_at
+                    .unwrap()
+                    .elapsed()
+                    .unwrap()
+                    .as_millis() as u64;
+                if service_time > block.deadline {
+                    let (final_size, _unsent) =
+                        stream.send.shutdown().unwrap_or((0, 0));
+                    info!(
+                        "service_time {} > block.deadline {}",
+                        service_time, block.deadline
+                    );
+                    self.mark_cancelled(b.stream_id, true, final_size);
+
+                    None
+                } else {
+                    match block.real_priority(
+                        recovery.0,
+                        recovery.1,
+                        service_time,
+                    ) {
+                        Some(priority) =>
+                            Some(std::cmp::Reverse(FlushableBlock {
+                                stream_id: b.stream_id,
+                                priority,
+                            })),
+                        None => {
+                            let (final_size, _unsent) =
+                                stream.send.shutdown().unwrap_or((0, 0));
+                            self.mark_cancelled(b.stream_id, true, final_size);
+                            None
+                        },
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        self.flushable.dtp_scheduler = BinaryHeap::from(flushable);
     }
 
     /// Adds or removes the stream ID to/from the readable streams set.
@@ -471,6 +680,21 @@ impl StreamMap {
             self.stopped.insert(stream_id, error_code);
         } else {
             self.stopped.remove(&stream_id);
+        }
+    }
+
+    /// Adds or removes the stream ID to/from the cancelled streams set
+    ///
+    /// If the stream was already in the list, this does nothing.
+    #[cfg(feature = "dtp")]
+    pub fn mark_cancelled(
+        &mut self, stream_id: u64, cancelled: bool, final_size: u64,
+    ) {
+        if cancelled {
+            info!("marking stream {} cancelled", stream_id);
+            self.cancelled.insert(stream_id, final_size);
+        } else {
+            self.cancelled.remove(&stream_id);
         }
     }
 
@@ -572,14 +796,29 @@ impl StreamMap {
         self.stopped.iter()
     }
 
+    /// Creates an iterator over streams that are cancelled and
+    /// need to send RESET_STREAM.
+    #[cfg(feature = "dtp")]
+    pub fn cancelled(&self) -> hash_map::Iter<u64, u64> {
+        self.cancelled.iter()
+    }
+
     /// Returns true if the stream has been collected.
     pub fn is_collected(&self, stream_id: u64) -> bool {
         self.collected.contains(&stream_id)
     }
 
     /// Returns true if there are any streams that have data to write.
+    #[cfg(not(feature = "dtp"))]
     pub fn has_flushable(&self) -> bool {
         !self.flushable.is_empty()
+    }
+
+    /// Returns true if there are any streams that have data to write.
+    #[cfg(feature = "dtp")]
+    pub fn has_flushable(&self) -> bool {
+        !self.flushable.dtp_scheduler.is_empty() ||
+            !self.flushable.quic_scheduler.is_empty()
     }
 
     /// Returns true if there are any streams that have data to read.
@@ -608,6 +847,13 @@ impl StreamMap {
         !self.stopped.is_empty()
     }
 
+    /// Returns true if there are any streams that are cancelled and need to
+    /// send STOP_SENDING.
+    #[cfg(feature = "dtp")]
+    pub fn has_cancelled(&self) -> bool {
+        !self.cancelled.is_empty()
+    }
+
     /// Returns true if the max bidirectional streams count needs to be updated
     /// by sending a MAX_STREAMS frame to the peer.
     pub fn should_update_max_streams_bidi(&self) -> bool {
@@ -628,6 +874,93 @@ impl StreamMap {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.streams.len()
+    }
+}
+
+/// Flushable Block Info.
+#[cfg(feature = "dtp")]
+#[derive(Debug, Clone)]
+pub struct FlushableBlock {
+    pub stream_id: u64,
+    pub priority: u64,
+}
+
+#[cfg(feature = "dtp")]
+impl PartialEq for FlushableBlock {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream_id == other.stream_id
+    }
+}
+
+#[cfg(feature = "dtp")]
+impl Eq for FlushableBlock {}
+
+#[cfg(feature = "dtp")]
+impl PartialOrd for FlushableBlock {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.priority.partial_cmp(&other.priority)
+    }
+}
+
+#[cfg(feature = "dtp")]
+impl Ord for FlushableBlock {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+/// Schduler of QUIC + DTP
+#[cfg(feature = "dtp")]
+#[derive(Debug, Default)]
+struct Scheduler {
+    pub dtp_scheduler: BinaryHeap<std::cmp::Reverse<FlushableBlock>>,
+    pub quic_scheduler:
+        BTreeMap<u8, (BinaryHeap<std::cmp::Reverse<u64>>, VecDeque<u64>)>,
+}
+
+/// A DTP Block.
+#[cfg(feature = "dtp")]
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct Block {
+    /// The DTP block size.
+    pub size: u64,
+    /// The DTP block priority.
+    pub priority: u64,
+    /// The DTP block deadline.
+    pub deadline: u64,
+}
+
+#[cfg(feature = "dtp")]
+impl Block {
+    /// Calculate the real priority used in scheduler for this block.
+    ///
+    /// ## Arguments
+    ///
+    /// - `delivery_rate`: The delivery rate of the stream. Bytes per
+    ///   microsecond.
+    /// - `rtt`: Half of the round trip time of the stream.
+    /// - `service_time`: The service time of the stream. microseconds.
+    ///
+    /// ## Return
+    ///
+    /// The real priority of the block used in the scheduler.
+    pub fn real_priority(
+        &self, delivery_rate: u64, rtt: u64, service_time: u64,
+    ) -> Option<u64> {
+        match self
+            .deadline
+            .checked_sub(self.size / delivery_rate + rtt + service_time)
+        {
+            Some(v) => Some(v * (self.priority + 1)),
+            None => {
+                info!(
+                    "real_priority < 0: ddl {} size {} rate {} rtt {} service {}",
+                    self.deadline, self.size, delivery_rate, rtt, service_time
+                );
+                None
+            },
+        }
     }
 }
 
@@ -654,22 +987,39 @@ pub struct Stream {
 
     /// Whether the stream can be flushed incrementally. Default is `true`.
     pub incremental: bool,
+
+    /// Corresponding DTP Block info
+    #[cfg(feature = "dtp")]
+    pub block: Option<Arc<Block>>,
 }
 
 impl Stream {
     /// Creates a new stream with the given flow control limits.
     pub fn new(
         max_rx_data: u64, max_tx_data: u64, bidi: bool, local: bool,
-        max_window: u64,
+        max_window: u64, #[cfg(feature = "dtp")] block: Option<Arc<Block>>,
     ) -> Stream {
         Stream {
-            recv: RecvBuf::new(max_rx_data, max_window),
-            send: SendBuf::new(max_tx_data),
+            recv: RecvBuf::new(
+                max_rx_data,
+                max_window,
+                #[cfg(feature = "dtp")]
+                block.clone().map(|b| Arc::downgrade(&b)),
+                #[cfg(feature = "dtp")]
+                None,
+            ),
+            send: SendBuf::new(
+                max_tx_data,
+                #[cfg(feature = "dtp")]
+                block.clone().map(|b| Arc::downgrade(&b)),
+            ),
             bidi,
             local,
             data: None,
             urgency: DEFAULT_URGENCY,
             incremental: true,
+            #[cfg(feature = "dtp")]
+            block,
         }
     }
 
@@ -720,6 +1070,18 @@ impl Stream {
     /// Returns true if the stream is not storing incoming data.
     pub fn is_draining(&self) -> bool {
         self.recv.drain
+    }
+
+    #[cfg(feature = "dtp")]
+    pub fn block(&self) -> Block {
+        match &self.block {
+            Some(block) => (**block).clone(),
+            None => Block {
+                size: 0,
+                priority: 0,
+                deadline: 0,
+            },
+        }
     }
 }
 
@@ -792,17 +1154,39 @@ pub struct RecvBuf {
 
     /// Whether incoming data is validated but not buffered.
     drain: bool,
+
+    /// Corresponding DTP Block info
+    #[cfg(feature = "dtp")]
+    pub block: Option<Weak<Block>>,
+
+    /// When the block start to be transmitted
+    ///
+    /// Duration since the UNIX_EPOCH
+    #[cfg(feature = "dtp")]
+    pub started_at: Option<time::Duration>,
+
+    /// The completion time of the block
+    #[cfg(feature = "dtp")]
+    bct: time::Duration,
 }
 
 impl RecvBuf {
     /// Creates a new receive buffer.
-    fn new(max_data: u64, max_window: u64) -> RecvBuf {
+    fn new(
+        max_data: u64, max_window: u64,
+        #[cfg(feature = "dtp")] block: Option<Weak<Block>>,
+        #[cfg(feature = "dtp")] started_at: Option<time::Duration>,
+    ) -> RecvBuf {
         RecvBuf {
             flow_control: flowcontrol::FlowControl::new(
                 max_data,
                 cmp::min(max_data, DEFAULT_STREAM_WINDOW),
                 max_window,
             ),
+            #[cfg(feature = "dtp")]
+            block,
+            #[cfg(feature = "dtp")]
+            started_at,
             ..RecvBuf::default()
         }
     }
@@ -848,6 +1232,13 @@ impl RecvBuf {
 
         if buf.fin() {
             self.fin_off = Some(buf.max_off());
+            #[cfg(feature = "dtp")]
+            {
+                self.bct = time::SystemTime::now()
+                    .duration_since(time::UNIX_EPOCH)
+                    .unwrap() -
+                    self.started_at.unwrap_or(time::Duration::default());
+            }
         }
 
         // No need to store empty buffer that doesn't carry the fin flag.
@@ -1086,6 +1477,12 @@ impl RecvBuf {
 
         buf.off() == self.off
     }
+
+    /// Returns the completion time of the stream.
+    #[cfg(feature = "dtp")]
+    pub fn bct(&self) -> u64 {
+        self.bct.as_micros() as u64
+    }
 }
 
 /// Send-side stream buffer.
@@ -1128,13 +1525,33 @@ pub struct SendBuf {
 
     /// The error code received via STOP_SENDING.
     error: Option<u64>,
+
+    /// Corresponding DTP Block info
+    #[cfg(feature = "dtp")]
+    pub block: Option<Weak<Block>>,
+
+    /// Whether the block info has been transmitted
+    #[cfg(feature = "dtp")]
+    block_info_sent: bool,
+
+    /// When the block start to be transmitted
+    #[cfg(feature = "dtp")]
+    started_at: Option<time::SystemTime>,
 }
 
 impl SendBuf {
     /// Creates a new send buffer.
-    fn new(max_data: u64) -> SendBuf {
+    fn new(
+        max_data: u64, #[cfg(feature = "dtp")] block: Option<Weak<Block>>,
+    ) -> SendBuf {
         SendBuf {
             max_data,
+            #[cfg(feature = "dtp")]
+            block,
+            #[cfg(feature = "dtp")]
+            block_info_sent: false,
+            #[cfg(feature = "dtp")]
+            started_at: Some(time::SystemTime::now()),
             ..SendBuf::default()
         }
     }
@@ -1506,6 +1923,28 @@ impl SendBuf {
         }
 
         Ok((self.max_data - self.off) as usize)
+    }
+
+    /// Returns true if the block info has been sent.
+    #[cfg(feature = "dtp")]
+    pub fn is_block_info_sent(&self) -> bool {
+        self.block_info_sent
+    }
+
+    /// Set the block_info_sent flag.
+    #[cfg(feature = "dtp")]
+    pub fn set_block_info_sent(&mut self, sent: bool) {
+        self.block_info_sent = sent;
+    }
+
+    /// Returns the started_at time in microseconds since the UNIX_EPOCH.
+    #[cfg(feature = "dtp")]
+    pub fn started_at(&mut self) -> u64 {
+        self.started_at
+            .unwrap()
+            .duration_since(time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
     }
 }
 

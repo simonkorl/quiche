@@ -726,6 +726,8 @@ pub struct SendInfo {
     to_len: socklen_t,
 
     at: timespec,
+
+    diffserv: u8,
 }
 
 #[no_mangle]
@@ -744,6 +746,11 @@ pub extern fn quiche_conn_send(
             out_info.to_len = std_addr_to_c(&info.to, &mut out_info.to);
 
             std_time_to_c(&info.at, &mut out_info.at);
+
+            #[cfg(feature = "diffserv")]
+            {
+                out_info.diffserv = info.diffserv;
+            }
 
             v as ssize_t
         },
@@ -790,6 +797,40 @@ pub extern fn quiche_conn_stream_send(
 
         Err(e) => e.to_c(),
     }
+}
+
+#[cfg(feature = "dtp")]
+#[no_mangle]
+pub extern fn quiche_conn_block_send(
+    conn: &mut Connection, stream_id: u64, buf: *const u8, buf_len: size_t,
+    fin: bool, block: &stream::Block,
+) -> ssize_t {
+    if buf_len > <ssize_t>::max_value() as usize {
+        panic!("The provided buffer is too large");
+    }
+
+    let buf = unsafe { slice::from_raw_parts(buf, buf_len) };
+    let block = Arc::new(block.to_owned());
+
+    match conn.block_send(stream_id, buf, fin, block) {
+        Ok(v) => v as ssize_t,
+
+        Err(e) => e.to_c(),
+    }
+}
+
+#[cfg(feature = "dtp")]
+#[no_mangle]
+pub extern fn quiche_conn_block_info(
+    conn: &Connection, stream_id: u64, block: &mut stream::Block,
+) {
+    *block = conn.block_info(stream_id).unwrap();
+}
+
+#[cfg(feature = "dtp")]
+#[no_mangle]
+pub extern fn quiche_conn_bct(conn: &Connection, stream_id: u64) -> u64 {
+    conn.bct(stream_id)
 }
 
 #[no_mangle]
