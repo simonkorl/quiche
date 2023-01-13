@@ -1333,6 +1333,11 @@ pub struct Connection {
     /// Whether the connection should prevent from reusing destination
     /// Connection IDs when the peer migrates.
     disable_dcid_reuse: bool,
+
+    #[cfg(feature = "dtp")]
+    /// parse ACK frames and determine whether to send and parse 
+    /// DTP defined timestamped ACK frame
+    peer_enable_dtp_timestamped_ack: bool,
 }
 
 /// Creates a new server-side connection.
@@ -1767,6 +1772,9 @@ impl Connection {
             emit_dgram: true,
 
             disable_dcid_reuse: config.disable_dcid_reuse,
+
+            #[cfg(feature = "dtp")]
+            peer_enable_dtp_timestamped_ack: true,
         };
 
         if let Some(odcid) = odcid {
@@ -2409,6 +2417,8 @@ impl Connection {
             AddrTupleFmt(info.from, info.to)
         );
 
+        trace!("Hello World!");
+
         #[cfg(feature = "qlog")]
         let mut qlog_frames = vec![];
 
@@ -2433,6 +2443,7 @@ impl Connection {
             return Err(Error::InvalidPacket);
         }
 
+        trace!("Hello World! 1");
         // Now that we decrypted the packet, let's see if we can map it to an
         // existing path.
         let recv_pid = if hdr.ty == packet::Type::Short && self.got_peer_conn_id {
@@ -2443,6 +2454,7 @@ impl Connection {
             self.paths.get_active_path_id()?
         };
 
+        trace!("Hello World! 2");
         if !self.is_server && !self.got_peer_conn_id {
             if self.odcid.is_none() {
                 self.odcid = Some(self.destination_id().into_owned());
@@ -2491,6 +2503,8 @@ impl Connection {
 
         // Process packet payload.
         while payload.cap() > 0 {
+            info!("payload len: {}", payload.len());
+            // Error: 
             let frame = frame::Frame::from_bytes(&mut payload, hdr.ty)?;
 
             qlog_with_type!(QLOG_PACKET_RX, self.qlog, _q, {
@@ -2556,6 +2570,8 @@ impl Connection {
             // Any frame error is terminal, so now just return.
             return Err(e);
         }
+
+        trace!("Hello World! 5");
 
         // Only log the remote transport parameters once the connection is
         // established (i.e. after frames have been fully parsed) and only
@@ -2725,6 +2741,8 @@ impl Connection {
             self.idle_timer = Some(now + idle_timeout);
         }
 
+        trace!("update");
+
         // Update send capacity.
         self.update_tx_cap();
 
@@ -2735,6 +2753,8 @@ impl Connection {
 
         self.recv_bytes += read as u64;
         self.paths.get_mut(recv_pid)?.recv_bytes += read as u64;
+
+        trace!("before handshake");
 
         // An Handshake packet has been received from the client and has been
         // successfully processed, so we can drop the initial state and consider
@@ -3425,11 +3445,15 @@ impl Connection {
             let timestamp = timestamp / scale;
 
             let frame = frame::Frame::ACK {
-                #[cfg(feature = "dtp")]
-                timestamp,
                 ack_delay,
                 ranges: self.pkt_num_spaces[epoch].recv_pkt_need_ack.clone(),
                 ecn_counts: None, // sending ECN is not supported at this time
+                #[cfg(feature = "dtp")] 
+                timestamp: if self.peer_enable_dtp_timestamped_ack {
+                    Some(timestamp)
+                } else {
+                    None
+                },
             };
 
             if push_frame_to_pkt!(b, frames, frame, left) {
@@ -6767,7 +6791,10 @@ impl Connection {
             frame::Frame::Ping => (),
 
             frame::Frame::ACK {
-                ranges, ack_delay, ..
+                ranges, ack_delay,
+                ecn_counts,
+                #[cfg(feature = "dtp")]
+                timestamp
             } => {
                 let ack_delay = ack_delay
                     .checked_mul(2_u64.pow(
@@ -6811,6 +6838,11 @@ impl Connection {
 
                 if self.handshake_confirmed {
                     self.drop_epoch_state(packet::Epoch::Handshake, now);
+                }
+
+                #[cfg(feature = "dtp")]
+                if self.peer_enable_dtp_timestamped_ack && timestamp.is_none() {
+                    self.peer_enable_dtp_timestamped_ack = false;
                 }
             },
 
@@ -10427,11 +10459,11 @@ mod tests {
         ranges.insert(0..6);
 
         let frames = [frame::Frame::ACK {
-            #[cfg(feature = "dtp")]
-            timestamp: 0,
             ack_delay: 15,
             ranges,
             ecn_counts: None,
+            #[cfg(feature = "dtp")]
+            timestamp: None,
         }];
 
         assert_eq!(pipe.send_pkt_to_server(pkt_type, &frames, &mut buf), Ok(0));

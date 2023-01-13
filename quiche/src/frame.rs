@@ -63,11 +63,11 @@ pub enum Frame {
     Ping,
 
     ACK {
-        #[cfg(feature = "dtp")]
-        timestamp: u64,
         ack_delay: u64,
         ranges: ranges::RangeSet,
         ecn_counts: Option<EcnCounts>,
+        #[cfg(feature = "dtp")]
+        timestamp: Option<u64>,
     },
 
     ResetStream {
@@ -325,6 +325,9 @@ impl Frame {
                 started_at: b.get_varint()?,
             },
 
+            #[cfg(feature = "dtp")]
+            0x22..=0x23 => parse_dtp_ack_frame(frame_type, b)?,
+
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
             _ => return Err(Error::InvalidFrame),
@@ -384,17 +387,27 @@ impl Frame {
             },
 
             Frame::ACK {
-                #[cfg(feature = "dtp")]
-                timestamp,
                 ack_delay,
                 ranges,
                 ecn_counts,
+                #[cfg(feature = "dtp")]
+                timestamp,
             } => {
-                if ecn_counts.is_none() {
-                    b.put_varint(0x02)?;
+                let mut ty = if ecn_counts.is_none() {
+                    0x02
                 } else {
-                    b.put_varint(0x03)?;
+                    0x03
+                };
+
+                #[cfg(feature = "dtp")] {
+                    ty += if timestamp.is_none() {
+                        0x00
+                    } else {
+                        0x20
+                    };
                 }
+
+                b.put_varint(ty)?;
 
                 let mut it = ranges.iter().rev();
 
@@ -402,8 +415,6 @@ impl Frame {
                 let ack_block = (first.end - 1) - first.start;
 
                 b.put_varint(first.end - 1)?;
-                #[cfg(feature = "dtp")]
-                b.put_varint(*timestamp)?;
                 b.put_varint(*ack_delay)?;
                 b.put_varint(it.len() as u64)?;
                 b.put_varint(ack_block)?;
@@ -424,6 +435,11 @@ impl Frame {
                     b.put_varint(ecn.ect0_count)?;
                     b.put_varint(ecn.ect1_count)?;
                     b.put_varint(ecn.ecn_ce_count)?;
+                }
+
+                #[cfg(feature = "dtp")]
+                if let Some(stamp) = timestamp {
+                    b.put_varint(*stamp)?;
                 }
             },
 
@@ -622,28 +638,19 @@ impl Frame {
             Frame::Ping => 1,
 
             Frame::ACK {
-                #[cfg(feature = "dtp")]
-                timestamp,
                 ack_delay,
                 ranges,
                 ecn_counts,
+                #[cfg(feature = "dtp")]
+                timestamp,
             } => {
                 let mut it = ranges.iter().rev();
 
                 let first = it.next().unwrap();
                 let ack_block = (first.end - 1) - first.start;
 
-                #[cfg(not(feature = "dtp"))]
                 let mut len = 1 + // frame type
                     octets::varint_len(first.end - 1) + // largest_ack
-                    octets::varint_len(*ack_delay) + // ack_delay
-                    octets::varint_len(it.len() as u64) + // block_count
-                    octets::varint_len(ack_block); // first_block
-
-                #[cfg(feature = "dtp")]
-                let mut len = 1 + // frame type
-                    octets::varint_len(first.end - 1) + // largest_ack
-                    octets::varint_len(*timestamp) + // timestamp
                     octets::varint_len(*ack_delay) + // ack_delay
                     octets::varint_len(it.len() as u64) + // block_count
                     octets::varint_len(ack_block); // first_block
@@ -664,6 +671,11 @@ impl Frame {
                     len += octets::varint_len(ecn.ect0_count) +
                         octets::varint_len(ecn.ect1_count) +
                         octets::varint_len(ecn.ecn_ce_count);
+                }
+
+                #[cfg(feature = "dtp")]
+                if let Some(stamp) = timestamp {
+                    len += octets::varint_len(*stamp);
                 }
 
                 len
@@ -1093,11 +1105,11 @@ impl std::fmt::Debug for Frame {
             },
 
             Frame::ACK {
-                #[cfg(feature = "dtp")]
-                timestamp,
                 ack_delay,
                 ranges,
                 ecn_counts,
+                #[cfg(feature = "dtp")]
+                timestamp,
             } => {
                 #[cfg(not(feature = "dtp"))]
                 write!(
@@ -1108,8 +1120,8 @@ impl std::fmt::Debug for Frame {
                 #[cfg(feature = "dtp")]
                 write!(
                     f,
-                    "ACK timestamp={} delay={} blocks={:?} ecn_counts={:?}",
-                    timestamp, ack_delay, ranges, ecn_counts
+                    "ACK delay={} blocks={:?} ecn_counts={:?} timestamp={:?}",
+                    ack_delay, ranges, ecn_counts, timestamp, 
                 )?;
             },
 
@@ -1289,8 +1301,7 @@ fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     let first = ty as u8;
 
     let largest_ack = b.get_varint()?;
-    #[cfg(feature = "dtp")]
-    let timestamp = b.get_varint()?;
+
     let ack_delay = b.get_varint()?;
     let block_count = b.get_varint()?;
     let ack_block = b.get_varint()?;
@@ -1337,11 +1348,71 @@ fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     };
 
     Ok(Frame::ACK {
-        #[cfg(feature = "dtp")]
-        timestamp,
         ack_delay,
         ranges,
         ecn_counts,
+        #[cfg(feature = "dtp")]
+        timestamp: None,
+    })
+}
+
+#[cfg(feature = "dtp")]
+fn parse_dtp_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
+    let first = ty as u8;
+
+    let largest_ack = b.get_varint()?;
+    let ack_delay = b.get_varint()?;
+    let block_count = b.get_varint()?;
+    let ack_block = b.get_varint()?;
+
+    if largest_ack < ack_block {
+        return Err(Error::InvalidFrame);
+    }
+
+    let mut smallest_ack = largest_ack - ack_block;
+
+    let mut ranges = ranges::RangeSet::default();
+
+    ranges.insert(smallest_ack..largest_ack + 1);
+
+    for _i in 0..block_count {
+        let gap = b.get_varint()?;
+
+        if smallest_ack < 2 + gap {
+            return Err(Error::InvalidFrame);
+        }
+
+        let largest_ack = (smallest_ack - gap) - 2;
+        let ack_block = b.get_varint()?;
+
+        if largest_ack < ack_block {
+            return Err(Error::InvalidFrame);
+        }
+
+        smallest_ack = largest_ack - ack_block;
+
+        ranges.insert(smallest_ack..largest_ack + 1);
+    }
+
+    let ecn_counts = if first & 0x01 != 0 {
+        let ecn = EcnCounts {
+            ect0_count: b.get_varint()?,
+            ect1_count: b.get_varint()?,
+            ecn_ce_count: b.get_varint()?,
+        };
+
+        Some(ecn)
+    } else {
+        None
+    };
+
+    let timestamp = Some(b.get_varint()?);
+
+    Ok(Frame::ACK {
+        ack_delay,
+        ranges,
+        ecn_counts,
+        timestamp,
     })
 }
 
@@ -1512,11 +1583,11 @@ mod tests {
         ranges.insert(3000..5000);
 
         let frame = Frame::ACK {
-            #[cfg(feature = "dtp")]
-            timestamp: 0,
             ack_delay: 874_656_534,
             ranges,
             ecn_counts: None,
+            #[cfg(feature = "dtp")]
+            timestamp: Some(0),
         };
 
         let wire_len = {
@@ -1559,11 +1630,11 @@ mod tests {
         });
 
         let frame = Frame::ACK {
-            #[cfg(feature = "dtp")]
-            timestamp: 0,
             ack_delay: 874_656_534,
             ranges,
             ecn_counts,
+            #[cfg(feature = "dtp")]
+            timestamp: Some(0),
         };
 
         let wire_len = {
