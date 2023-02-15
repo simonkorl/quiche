@@ -603,7 +603,7 @@ pub struct ConnectionError {
 #[repr(C)]
 pub enum Shutdown {
     /// Stop receiving stream data.
-    Read  = 0,
+    Read = 0,
 
     /// Stop sending stream data.
     Write = 1,
@@ -615,10 +615,10 @@ pub enum Shutdown {
 #[cfg_attr(docsrs, doc(cfg(feature = "qlog")))]
 pub enum QlogLevel {
     /// Logs any events of Core importance.
-    Core  = 0,
+    Core = 0,
 
     /// Logs any events of Core and Base importance.
-    Base  = 1,
+    Base = 1,
 
     /// Logs any events of Core, Base and Extra importance
     Extra = 2,
@@ -1255,7 +1255,12 @@ pub fn accept(
     config: &mut Config,
 ) -> Result<Connection> {
     let conn = Connection::new(scid, odcid, from, config, true)?;
-
+    trace!("input from peer addr : {}:{}", from.ip(), from.port());
+    trace!(
+        "accepted connection peer addr : {}:{}",
+        conn.peer_addr.ip(),
+        conn.peer_addr.port()
+    );
     Ok(conn)
 }
 
@@ -1390,10 +1395,10 @@ pub fn retry(
 pub fn version_is_supported(version: u32) -> bool {
     matches!(
         version,
-        PROTOCOL_VERSION_V1 |
-            PROTOCOL_VERSION_DRAFT27 |
-            PROTOCOL_VERSION_DRAFT28 |
-            PROTOCOL_VERSION_DRAFT29
+        PROTOCOL_VERSION_V1
+            | PROTOCOL_VERSION_DRAFT27
+            | PROTOCOL_VERSION_DRAFT28
+            | PROTOCOL_VERSION_DRAFT29
     )
 }
 
@@ -1892,6 +1897,8 @@ impl Connection {
             .crypto_0rtt_open
             .is_some()
         {
+            trace!("debug:Process previously undecryptable 0-RTT packet");
+
             while let Some((mut pkt, info)) = self.undecryptable_pkts.pop_front()
             {
                 if let Err(e) = self.recv(&mut pkt, info) {
@@ -1945,7 +1952,7 @@ impl Connection {
                     &self.trace_id,
                 )
             })?;
-
+        trace!("debug:recv packet type{:?}", hdr.ty);
         if hdr.ty == packet::Type::VersionNegotiation {
             // Version negotiation packets can only be sent by the server.
             if self.is_server {
@@ -2169,9 +2176,9 @@ impl Connection {
             Some(v) => v,
 
             None => {
-                if hdr.ty == packet::Type::ZeroRTT &&
-                    self.undecryptable_pkts.len() < MAX_UNDECRYPTABLE_PACKETS &&
-                    !self.is_established()
+                if hdr.ty == packet::Type::ZeroRTT
+                    && self.undecryptable_pkts.len() < MAX_UNDECRYPTABLE_PACKETS
+                    && !self.is_established()
                 {
                     // Buffer 0-RTT packets when the required read key is not
                     // available yet, and process them later.
@@ -2180,7 +2187,7 @@ impl Connection {
                     // of undecryptable packets as well.
                     let pkt_len = b.off() + payload_len;
                     let pkt = (b.buf()[..pkt_len]).to_vec();
-
+                    trace!("debug:info A");
                     self.undecryptable_pkts.push_back((pkt, *info));
                     return Ok(pkt_len);
                 }
@@ -2257,9 +2264,9 @@ impl Connection {
         if self.is_server && !self.got_peer_conn_id {
             self.dcid = hdr.scid.clone();
 
-            if !self.did_retry &&
-                (self.version >= PROTOCOL_VERSION_DRAFT28 ||
-                    self.version == PROTOCOL_VERSION_V1)
+            if !self.did_retry
+                && (self.version >= PROTOCOL_VERSION_DRAFT28
+                    || self.version == PROTOCOL_VERSION_V1)
             {
                 self.local_transport_params
                     .original_destination_connection_id =
@@ -2448,6 +2455,12 @@ impl Connection {
 
         if let Some(idle_timeout) = self.idle_timeout() {
             self.idle_timer = Some(now + idle_timeout);
+            trace!(
+                "update now {:?} +idle_timeout{:?}=idle_time{:?}",
+                now,
+                idle_timeout,
+                self.idle_timer
+            );
         }
 
         // Update send capacity.
@@ -2548,6 +2561,7 @@ impl Connection {
             .crypto_0rtt_open
             .is_some()
         {
+            trace!("debug:info B");
             while let Some((mut pkt, info)) = self.undecryptable_pkts.pop_front()
             {
                 if self.recv(&mut pkt, info).is_err() {
@@ -2685,10 +2699,10 @@ impl Connection {
 
         #[cfg(feature = "diffserv")]
         match pkt_type {
-            Type::Initial |
-            Type::Handshake |
-            Type::Retry |
-            Type::VersionNegotiation => {
+            Type::Initial
+            | Type::Handshake
+            | Type::Retry
+            | Type::VersionNegotiation => {
                 *diffserv = 5 << 3;
             },
             _ => {},
@@ -2764,11 +2778,12 @@ impl Connection {
                     stream_id,
                     error_code,
                     final_size,
-                } =>
+                } => {
                     if self.streams.get(stream_id).is_some() {
                         self.streams
                             .mark_reset(stream_id, true, error_code, final_size);
-                    },
+                    }
+                },
 
                 // Retransmit HANDSHAKE_DONE only if it hasn't been acked at
                 // least once already.
@@ -2893,10 +2908,10 @@ impl Connection {
         let payload_offset = b.off();
 
         // Create ACK frame.
-        if self.pkt_num_spaces[epoch].recv_pkt_need_ack.len() > 0 &&
-            (self.pkt_num_spaces[epoch].ack_elicited ||
-                self.recovery.loss_probes[epoch] > 0) &&
-            !is_closing
+        if self.pkt_num_spaces[epoch].recv_pkt_need_ack.len() > 0
+            && (self.pkt_num_spaces[epoch].ack_elicited
+                || self.recovery.loss_probes[epoch] > 0)
+            && !is_closing
         {
             let scale =
                 2_u64.pow(self.local_transport_params.ack_delay_exponent as u32);
@@ -2908,8 +2923,8 @@ impl Connection {
             let timestamp = time::SystemTime::now()
                 .duration_since(time::UNIX_EPOCH)
                 .expect("SystemTime before UNIX EPOCH!")
-                .as_micros() as u64 -
-                ack_delay.as_micros() as u64;
+                .as_micros() as u64
+                - ack_delay.as_micros() as u64;
 
             let ack_delay = ack_delay.as_micros() as u64 / scale;
 
@@ -3244,9 +3259,9 @@ impl Connection {
         }
 
         // Create CRYPTO frame.
-        if self.pkt_num_spaces[epoch].crypto_stream.is_flushable() &&
-            left > frame::MAX_CRYPTO_OVERHEAD &&
-            !is_closing
+        if self.pkt_num_spaces[epoch].crypto_stream.is_flushable()
+            && left > frame::MAX_CRYPTO_OVERHEAD
+            && !is_closing
         {
             let crypto_off =
                 self.pkt_num_spaces[epoch].crypto_stream.send.off_front();
@@ -3331,10 +3346,10 @@ impl Connection {
         }
 
         // Create DATAGRAM frame.
-        if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT) &&
-            left > frame::MAX_DGRAM_OVERHEAD &&
-            !is_closing &&
-            do_dgram
+        if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT)
+            && left > frame::MAX_DGRAM_OVERHEAD
+            && !is_closing
+            && do_dgram
         {
             if let Some(max_dgram_payload) = self.dgram_max_writable_len() {
                 while let Some(len) = self.dgram_send_queue.peek_front_len() {
@@ -3408,10 +3423,10 @@ impl Connection {
         }
 
         // Create a single STREAM frame for the first stream that is flushable.
-        if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT) &&
-            left > frame::MAX_STREAM_OVERHEAD &&
-            !is_closing &&
-            !dgram_emitted
+        if (pkt_type == packet::Type::Short || pkt_type == packet::Type::ZeroRTT)
+            && left > frame::MAX_STREAM_OVERHEAD
+            && !is_closing
+            && !dgram_emitted
         {
             while let Some(stream_id) = self.streams.pop_flushable() {
                 let stream = match self.streams.get_mut(stream_id) {
@@ -3523,47 +3538,52 @@ impl Connection {
                         match block {
                             Block {
                                 deadline: 0..=100, ..
-                            } |
-                            Block { priority: 0, .. } =>
+                            }
+                            | Block { priority: 0, .. } => {
                                 if *diffserv < 5 << 3 {
                                     *diffserv = 5 << 3;
-                                },
+                                }
+                            },
                             Block {
                                 deadline: 101..=200,
                                 ..
-                            } |
-                            Block { priority: 1, .. } =>
+                            }
+                            | Block { priority: 1, .. } => {
                                 if *diffserv < 4 << 3 {
                                     *diffserv = 4 << 3;
-                                },
+                                }
+                            },
                             Block {
                                 deadline: 201..=500,
                                 ..
-                            } |
-                            Block { priority: 2, .. } =>
+                            }
+                            | Block { priority: 2, .. } => {
                                 if *diffserv < 3 << 3 {
                                     *diffserv = 3 << 3;
-                                },
+                                }
+                            },
                             Block {
                                 deadline: 501..=1000,
                                 ..
-                            } |
-                            Block {
+                            }
+                            | Block {
                                 priority: 3..=4, ..
-                            } =>
+                            } => {
                                 if *diffserv < 2 << 3 {
                                     *diffserv = 2 << 3;
-                                },
+                                }
+                            },
                             Block {
                                 deadline: 1001..=2000,
                                 ..
-                            } |
-                            Block {
+                            }
+                            | Block {
                                 priority: 5..=6, ..
-                            } =>
+                            } => {
                                 if *diffserv < 1 << 3 {
                                     *diffserv = 1 << 3;
-                                },
+                                }
+                            },
                             _ => {},
                         }
                     }
@@ -3601,10 +3621,10 @@ impl Connection {
         self.emit_dgram = !dgram_emitted;
 
         // Create PING for PTO probe if no other ack-eliciting frame is sent.
-        if self.recovery.loss_probes[epoch] > 0 &&
-            !ack_eliciting &&
-            left >= 1 &&
-            !is_closing
+        if self.recovery.loss_probes[epoch] > 0
+            && !ack_eliciting
+            && left >= 1
+            && !is_closing
         {
             let frame = frame::Frame::Ping;
 
@@ -3793,6 +3813,12 @@ impl Connection {
         if ack_eliciting && !self.ack_eliciting_sent {
             if let Some(idle_timeout) = self.idle_timeout() {
                 self.idle_timer = Some(now + idle_timeout);
+                trace!(
+                    "update now {:?} +idle_timeout{:?}=idle_time{:?}",
+                    now,
+                    idle_timeout,
+                    self.idle_timer
+                );
             }
         }
 
@@ -3849,8 +3875,8 @@ impl Connection {
         &mut self, stream_id: u64, out: &mut [u8],
     ) -> Result<(usize, bool)> {
         // We can't read on our own unidirectional streams.
-        if !stream::is_bidi(stream_id) &&
-            stream::is_local(stream_id, self.is_server)
+        if !stream::is_bidi(stream_id)
+            && stream::is_local(stream_id, self.is_server)
         {
             return Err(Error::InvalidStreamState(stream_id));
         }
@@ -3975,8 +4001,8 @@ impl Connection {
         &mut self, stream_id: u64, buf: &[u8], fin: bool,
     ) -> Result<usize> {
         // We can't write on the peer's unidirectional streams.
-        if !stream::is_bidi(stream_id) &&
-            !stream::is_local(stream_id, self.is_server)
+        if !stream::is_bidi(stream_id)
+            && !stream::is_local(stream_id, self.is_server)
         {
             return Err(Error::InvalidStreamState(stream_id));
         }
@@ -4142,8 +4168,8 @@ impl Connection {
         &mut self, stream_id: u64, buf: &[u8], fin: bool, block: Arc<Block>,
     ) -> Result<usize> {
         // We can't write on the peer's unidirectional streams.
-        if !stream::is_bidi(stream_id) &&
-            !stream::is_local(stream_id, self.is_server)
+        if !stream::is_bidi(stream_id)
+            && !stream::is_local(stream_id, self.is_server)
         {
             return Err(Error::InvalidStreamState(stream_id));
         }
@@ -4892,6 +4918,7 @@ impl Connection {
     /// [`on_timeout()`]: struct.Connection.html#method.on_timeout
     pub fn timeout(&self) -> Option<time::Duration> {
         if self.is_closed() {
+            trace!("timeout function say:is closed!!!,return None");
             return None;
         }
 
@@ -4919,7 +4946,7 @@ impl Connection {
 
             return Some(timeout.duration_since(now));
         }
-
+        trace!("defalut return None caste tiemout return to c is max number");
         None
     }
 
@@ -4931,7 +4958,7 @@ impl Connection {
 
         if let Some(draining_timer) = self.draining_timer {
             if draining_timer <= now {
-                trace!("{} draining timeout expired", self.trace_id);
+                trace!("{} draining timeout expired closed=true", self.trace_id);
 
                 qlog_with!(self.qlog, q, {
                     q.finish_log().ok();
@@ -4948,7 +4975,7 @@ impl Connection {
 
         if let Some(timer) = self.idle_timer {
             if timer <= now {
-                trace!("{} idle timeout expired", self.trace_id);
+                trace!("{} idle timeout expired closed=true", self.trace_id);
 
                 qlog_with!(self.qlog, q, {
                     q.finish_log().ok();
@@ -5014,6 +5041,7 @@ impl Connection {
 
         // When no packet was successfully processed close connection immediately.
         if self.recv_count == 0 {
+            trace!("{} no packet was successfully processed close connection immediately closed=true", self.trace_id);
             self.closed = true;
         }
 
@@ -5230,13 +5258,14 @@ impl Connection {
     fn parse_peer_transport_params(
         &mut self, peer_params: TransportParams,
     ) -> Result<()> {
-        if self.version >= PROTOCOL_VERSION_DRAFT28 ||
-            self.version == PROTOCOL_VERSION_V1
+        if self.version >= PROTOCOL_VERSION_DRAFT28
+            || self.version == PROTOCOL_VERSION_V1
         {
             // Validate initial_source_connection_id.
             match &peer_params.initial_source_connection_id {
-                Some(v) if v != &self.dcid =>
-                    return Err(Error::InvalidTransportParam),
+                Some(v) if v != &self.dcid => {
+                    return Err(Error::InvalidTransportParam)
+                },
 
                 Some(_) => (),
 
@@ -5248,15 +5277,17 @@ impl Connection {
             // Validate original_destination_connection_id.
             if let Some(odcid) = &self.odcid {
                 match &peer_params.original_destination_connection_id {
-                    Some(v) if v != odcid =>
-                        return Err(Error::InvalidTransportParam),
+                    Some(v) if v != odcid => {
+                        return Err(Error::InvalidTransportParam)
+                    },
 
                     Some(_) => (),
 
                     // original_destination_connection_id must be
                     // sent by the server.
-                    None if !self.is_server =>
-                        return Err(Error::InvalidTransportParam),
+                    None if !self.is_server => {
+                        return Err(Error::InvalidTransportParam)
+                    },
 
                     None => (),
                 }
@@ -5265,8 +5296,9 @@ impl Connection {
             // Validate retry_source_connection_id.
             if let Some(rscid) = &self.rscid {
                 match &peer_params.retry_source_connection_id {
-                    Some(v) if v != rscid =>
-                        return Err(Error::InvalidTransportParam),
+                    Some(v) if v != rscid => {
+                        return Err(Error::InvalidTransportParam)
+                    },
 
                     Some(_) => (),
 
@@ -5278,8 +5310,8 @@ impl Connection {
         } else {
             // Legacy validation of the original connection ID when
             // stateless retry is performed, for drafts < 28.
-            if self.did_retry &&
-                peer_params.original_destination_connection_id != self.odcid
+            if self.did_retry
+                && peer_params.original_destination_connection_id != self.odcid
             {
                 return Err(Error::InvalidTransportParam);
             }
@@ -5442,21 +5474,22 @@ impl Connection {
         // If there are flushable, almost full or blocked streams, use the
         // Application epoch.
         #[cfg(not(feature = "dtp"))]
-        if (self.is_established() || self.is_in_early_data()) &&
-            (self.should_send_handshake_done() ||
-                self.almost_full ||
-                self.blocked_limit.is_some() ||
-                self.dgram_send_queue.has_pending() ||
-                self.local_error
+        if (self.is_established() || self.is_in_early_data())
+            && (self.should_send_handshake_done()
+                || self.almost_full
+                || self.blocked_limit.is_some()
+                || self.dgram_send_queue.has_pending()
+                || self
+                    .local_error
                     .as_ref()
-                    .map_or(false, |conn_err| conn_err.is_app) ||
-                self.streams.should_update_max_streams_bidi() ||
-                self.streams.should_update_max_streams_uni() ||
-                self.streams.has_flushable() ||
-                self.streams.has_almost_full() ||
-                self.streams.has_blocked() ||
-                self.streams.has_reset() ||
-                self.streams.has_stopped())
+                    .map_or(false, |conn_err| conn_err.is_app)
+                || self.streams.should_update_max_streams_bidi()
+                || self.streams.should_update_max_streams_uni()
+                || self.streams.has_flushable()
+                || self.streams.has_almost_full()
+                || self.streams.has_blocked()
+                || self.streams.has_reset()
+                || self.streams.has_stopped())
         {
             // Only clients can send 0-RTT packets.
             if !self.is_server && self.is_in_early_data() {
@@ -5469,22 +5502,23 @@ impl Connection {
         // If there are flushable, almost full or blocked streams, use the
         // Application epoch.
         #[cfg(feature = "dtp")]
-        if (self.is_established() || self.is_in_early_data()) &&
-            (self.should_send_handshake_done() ||
-                self.almost_full ||
-                self.blocked_limit.is_some() ||
-                self.dgram_send_queue.has_pending() ||
-                self.local_error
+        if (self.is_established() || self.is_in_early_data())
+            && (self.should_send_handshake_done()
+                || self.almost_full
+                || self.blocked_limit.is_some()
+                || self.dgram_send_queue.has_pending()
+                || self
+                    .local_error
                     .as_ref()
-                    .map_or(false, |conn_err| conn_err.is_app) ||
-                self.streams.should_update_max_streams_bidi() ||
-                self.streams.should_update_max_streams_uni() ||
-                self.streams.has_flushable() ||
-                self.streams.has_almost_full() ||
-                self.streams.has_blocked() ||
-                self.streams.has_reset() ||
-                self.streams.has_stopped() ||
-                self.streams.has_cancelled())
+                    .map_or(false, |conn_err| conn_err.is_app)
+                || self.streams.should_update_max_streams_bidi()
+                || self.streams.should_update_max_streams_uni()
+                || self.streams.has_flushable()
+                || self.streams.has_almost_full()
+                || self.streams.has_blocked()
+                || self.streams.has_reset()
+                || self.streams.has_stopped()
+                || self.streams.has_cancelled())
         {
             // Only clients can send 0-RTT packets.
             if !self.is_server && self.is_in_early_data() {
@@ -5586,8 +5620,8 @@ impl Connection {
                 final_size,
             } => {
                 // Peer can't send on our unidirectional streams.
-                if !stream::is_bidi(stream_id) &&
-                    stream::is_local(stream_id, self.is_server)
+                if !stream::is_bidi(stream_id)
+                    && stream::is_local(stream_id, self.is_server)
                 {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
@@ -5633,8 +5667,8 @@ impl Connection {
                 error_code,
             } => {
                 // STOP_SENDING on a receive-only stream is a fatal error.
-                if !stream::is_local(stream_id, self.is_server) &&
-                    !stream::is_bidi(stream_id)
+                if !stream::is_local(stream_id, self.is_server)
+                    && !stream::is_bidi(stream_id)
                 {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
@@ -5705,8 +5739,8 @@ impl Connection {
 
             frame::Frame::Stream { stream_id, data } => {
                 // Peer can't send on our unidirectional streams.
-                if !stream::is_bidi(stream_id) &&
-                    stream::is_local(stream_id, self.is_server)
+                if !stream::is_bidi(stream_id)
+                    && stream::is_local(stream_id, self.is_server)
                 {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
@@ -5758,8 +5792,8 @@ impl Connection {
 
             frame::Frame::MaxStreamData { stream_id, max } => {
                 // Peer can't receive on its own unidirectional streams.
-                if !stream::is_bidi(stream_id) &&
-                    !stream::is_local(stream_id, self.is_server)
+                if !stream::is_bidi(stream_id)
+                    && !stream::is_local(stream_id, self.is_server)
                 {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
@@ -5830,15 +5864,17 @@ impl Connection {
 
             frame::Frame::StreamDataBlocked { .. } => (),
 
-            frame::Frame::StreamsBlockedBidi { limit } =>
+            frame::Frame::StreamsBlockedBidi { limit } => {
                 if limit > MAX_STREAM_ID {
                     return Err(Error::InvalidFrame);
-                },
+                }
+            },
 
-            frame::Frame::StreamsBlockedUni { limit } =>
+            frame::Frame::StreamsBlockedUni { limit } => {
                 if limit > MAX_STREAM_ID {
                     return Err(Error::InvalidFrame);
-                },
+                }
+            },
 
             // TODO: implement connection migration
             frame::Frame::NewConnectionId { .. } => (),
@@ -5913,8 +5949,8 @@ impl Connection {
                 started_at,
             } => {
                 // Peer can't send on our unidirectional streams.
-                if !stream::is_bidi(stream_id) &&
-                    stream::is_local(stream_id, self.is_server)
+                if !stream::is_bidi(stream_id)
+                    && stream::is_local(stream_id, self.is_server)
                 {
                     return Err(Error::InvalidStreamState(stream_id));
                 }
@@ -6005,8 +6041,8 @@ impl Connection {
         // If the transport parameter is set to 0, then the respective endpoint
         // decided to disable the idle timeout. If both are disabled we should
         // not set any timeout.
-        if self.local_transport_params.max_idle_timeout == 0 &&
-            self.peer_transport_params.max_idle_timeout == 0
+        if self.local_transport_params.max_idle_timeout == 0
+            && self.peer_transport_params.max_idle_timeout == 0
         {
             return None;
         }
@@ -6066,10 +6102,10 @@ impl Connection {
         // Note that this is equivalent to CheckIfApplicationLimited() from the
         // delivery rate draft. This is also separate from `recovery.app_limited`
         // and only applies to delivery rate calculation.
-        self.tx_cap >= self.recovery.cwnd_available() &&
-            (self.tx_data.saturating_sub(self.last_tx_data)) <
-                self.recovery.cwnd_available() as u64 &&
-            self.recovery.cwnd_available() > 0
+        self.tx_cap >= self.recovery.cwnd_available()
+            && (self.tx_data.saturating_sub(self.last_tx_data))
+                < self.recovery.cwnd_available() as u64
+            && self.recovery.cwnd_available() > 0
     }
 }
 
@@ -10667,10 +10703,13 @@ mod tests {
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
             let stream = frames.iter().next().unwrap();
 
-            assert_eq!(stream, &frame::Frame::Stream {
-                stream_id: 8,
-                data: stream::RangeBuf::from(&out, off, false),
-            });
+            assert_eq!(
+                stream,
+                &frame::Frame::Stream {
+                    stream_id: 8,
+                    data: stream::RangeBuf::from(&out, off, false),
+                }
+            );
 
             off = match stream {
                 frame::Frame::Stream { data, .. } => data.max_off(),
@@ -10690,10 +10729,13 @@ mod tests {
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
             let stream = frames.iter().next().unwrap();
 
-            assert_eq!(stream, &frame::Frame::Stream {
-                stream_id: 16,
-                data: stream::RangeBuf::from(&out, off, false),
-            });
+            assert_eq!(
+                stream,
+                &frame::Frame::Stream {
+                    stream_id: 16,
+                    data: stream::RangeBuf::from(&out, off, false),
+                }
+            );
 
             off = match stream {
                 frame::Frame::Stream { data, .. } => data.max_off(),
@@ -10713,10 +10755,13 @@ mod tests {
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
             let stream = frames.iter().next().unwrap();
 
-            assert_eq!(stream, &frame::Frame::Stream {
-                stream_id: 20,
-                data: stream::RangeBuf::from(&out, off, false),
-            });
+            assert_eq!(
+                stream,
+                &frame::Frame::Stream {
+                    stream_id: 20,
+                    data: stream::RangeBuf::from(&out, off, false),
+                }
+            );
 
             off = match stream {
                 frame::Frame::Stream { data, .. } => data.max_off(),
@@ -10751,10 +10796,13 @@ mod tests {
 
             let stream = frames.iter().next().unwrap();
 
-            assert_eq!(stream, &frame::Frame::Stream {
-                stream_id: 4,
-                data: stream::RangeBuf::from(&out, off, false),
-            });
+            assert_eq!(
+                stream,
+                &frame::Frame::Stream {
+                    stream_id: 4,
+                    data: stream::RangeBuf::from(&out, off, false),
+                }
+            );
 
             off = match stream {
                 frame::Frame::Stream { data, .. } => data.max_off(),
@@ -10774,10 +10822,13 @@ mod tests {
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
             let stream = frames.iter().next().unwrap();
 
-            assert_eq!(stream, &frame::Frame::Stream {
-                stream_id: 0,
-                data: stream::RangeBuf::from(&out, off, false),
-            });
+            assert_eq!(
+                stream,
+                &frame::Frame::Stream {
+                    stream_id: 0,
+                    data: stream::RangeBuf::from(&out, off, false),
+                }
+            );
 
             off = match stream {
                 frame::Frame::Stream { data, .. } => data.max_off(),
@@ -10982,9 +11033,10 @@ mod tests {
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
             let mut frame_iter = frames.iter();
 
-            assert_eq!(frame_iter.next().unwrap(), &frame::Frame::Datagram {
-                data: out.into(),
-            });
+            assert_eq!(
+                frame_iter.next().unwrap(),
+                &frame::Frame::Datagram { data: out.into() }
+            );
             assert_eq!(frame_iter.next(), None);
 
             // STREAM 0
@@ -10996,10 +11048,13 @@ mod tests {
             let mut frame_iter = frames.iter();
             let stream = frame_iter.next().unwrap();
 
-            assert_eq!(stream, &frame::Frame::Stream {
-                stream_id: 0,
-                data: stream::RangeBuf::from(&out, off_0, false),
-            });
+            assert_eq!(
+                stream,
+                &frame::Frame::Stream {
+                    stream_id: 0,
+                    data: stream::RangeBuf::from(&out, off_0, false),
+                }
+            );
 
             off_0 = match stream {
                 frame::Frame::Stream { data, .. } => data.max_off(),
@@ -11016,9 +11071,10 @@ mod tests {
                 testing::decode_pkt(&mut pipe.client, &mut buf, len).unwrap();
             let mut frame_iter = frames.iter();
 
-            assert_eq!(frame_iter.next().unwrap(), &frame::Frame::Datagram {
-                data: out.into(),
-            });
+            assert_eq!(
+                frame_iter.next().unwrap(),
+                &frame::Frame::Datagram { data: out.into() }
+            );
             assert_eq!(frame_iter.next(), None);
 
             // STREAM 4
@@ -11030,10 +11086,13 @@ mod tests {
             let mut frame_iter = frames.iter();
             let stream = frame_iter.next().unwrap();
 
-            assert_eq!(stream, &frame::Frame::Stream {
-                stream_id: 4,
-                data: stream::RangeBuf::from(&out, off_4, false),
-            });
+            assert_eq!(
+                stream,
+                &frame::Frame::Stream {
+                    stream_id: 4,
+                    data: stream::RangeBuf::from(&out, off_4, false),
+                }
+            );
 
             off_4 = match stream {
                 frame::Frame::Stream { data, .. } => data.max_off(),
